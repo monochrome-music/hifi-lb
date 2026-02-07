@@ -225,10 +225,15 @@ impl LoadBalancer {
             .map(|pq| pq.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
 
-        if path_and_query == "/health" && method == Method::GET {
-            return Ok(self.get_health_response());
+    if path_and_query == "/health" && (method == Method::GET || method == Method::HEAD) {
+        let response = self.get_health_response();
+        if method == Method::HEAD {
+            // Return headers and status but with empty body
+            let (parts, _) = response.into_parts();
+            return Ok(Response::from_parts(parts, Full::new(Bytes::new())));
         }
-
+        return Ok(response);
+}
         if let Some(cached) = self.get_cached(&method, &path_and_query) {
             let mut response = Response::builder().status(cached.status);
             for (name, value) in cached.headers.iter() {
