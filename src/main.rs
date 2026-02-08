@@ -1,4 +1,4 @@
-﻿use bytes::Bytes;
+use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderMap;
 use hyper::server::conn::http1;
@@ -16,6 +16,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+
+const ALLOWED_ORIGINS: &[&str] = &["monochrome.tf", "samidy.com"];
+
+fn is_origin_allowed(origin: &str) -> bool {
+    if let Ok(url) = origin.parse::<hyper::Uri>() {
+        if let Some(host) = url.host() {
+            return ALLOWED_ORIGINS.iter().any(|allowed| {
+                host == *allowed || host.ends_with(&format!(".{})", allowed))
+            });
+        }
+    }
+    false
+}
 
 struct Backend {
     url: String,
@@ -191,7 +204,7 @@ impl LoadBalancer {
         *health_status = new_health;
     }
 
-    fn get_health_response(&self) -> Response<Full<Bytes>> {
+    fn get_health_response(&self, origin: Option<&str>) -> Response<Full<Bytes>> {
         let health = self.health_status.read().clone();
         let all_healthy = health.iter().all(|h| h.healthy);
 
@@ -207,11 +220,16 @@ impl LoadBalancer {
             StatusCode::SERVICE_UNAVAILABLE
         };
 
-        Response::builder()
+        let mut response = Response::builder()
             .status(status)
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .unwrap()
+            .header("Content-Type", "application/json");
+        
+        if let Some(origin_str) = origin {
+            response = response.header("Access-Control-Allow-Origin", origin_str);
+            response = response.header("Access-Control-Allow-Credentials", "true");
+        }
+        
+        response.body(Full::new(Bytes::from(body))).unwrap()
     }
 
     async fn forward_request(
@@ -225,8 +243,33 @@ impl LoadBalancer {
             .map(|pq| pq.as_str().to_owned())
             .unwrap_or_else(|| "/".to_owned());
 
+        let origin = req.headers().get(hyper::header::ORIGIN)
+            .and_then(|v| v.to_str().ok());
+
+        if let Some(origin_str) = origin {
+            if !is_origin_allowed(origin_str) {
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Full::new(Bytes::from("CORS: Origin not allowed")))
+                    .unwrap());
+            }
+        }
+
+        if method == Method::OPTIONS {
+            if let Some(origin_str) = origin {
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .header("Access-Control-Allow-Origin", origin_str)
+                    .header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+                    .header("Access-Control-Max-Age", "86400")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap());
+            }
+        }
+
     if path_and_query == "/health" && (method == Method::GET || method == Method::HEAD) {
-        let response = self.get_health_response();
+        let response = self.get_health_response(origin);
         if method == Method::HEAD {
             // Return headers and status but with empty body
             let (parts, _) = response.into_parts();
@@ -234,12 +277,18 @@ impl LoadBalancer {
         }
         return Ok(response);
 }
+        let origin_value = origin.unwrap_or("*").to_string();
+
         if let Some(cached) = self.get_cached(&method, &path_and_query) {
             let mut response = Response::builder().status(cached.status);
             for (name, value) in cached.headers.iter() {
                 response = response.header(name.clone(), value.clone());
             }
             response = response.header("X-Cache", "HIT");
+            if origin.is_some() {
+                response = response.header("Access-Control-Allow-Origin", &origin_value);
+                response = response.header("Access-Control-Allow-Credentials", "true");
+            }
             return Ok(response.body(Full::new(cached.body)).unwrap());
         }
 
@@ -330,6 +379,10 @@ impl LoadBalancer {
                                 response = response.header(name.clone(), value.clone());
                             }
                             response = response.header("X-Cache", "MISS");
+                            if origin.is_some() {
+                                response = response.header("Access-Control-Allow-Origin", &origin_value);
+                                response = response.header("Access-Control-Allow-Credentials", "true");
+                            }
 
                             return Ok(response.body(Full::new(resp_body)).unwrap());
                         }
